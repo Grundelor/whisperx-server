@@ -1,0 +1,19 @@
+# WhisperX Transcription Server Dependencies
+faster-whisper>=1.1.0
+whisperx>=3.3.0
+pyannote.audio>=3.3.0
+
+# API Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+python-multipart>=0.0.18
+
+# Audio processing
+pydub>=0.25.1
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# HuggingFace (for pyannote model download)
+huggingface-hub>=0.27.0
+torch>=2.1.0
+torchaudio>=2.1.0
