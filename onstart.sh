@@ -18,15 +18,15 @@ SERVER_PID=$!
 echo "[onstart] Server started (PID=$SERVER_PID), listening on port 5000"
 
 # Wait for server to be ready
-for i in $(seq 1 30); do
+for i in $(seq 1 150); do
     if curl -sf http://localhost:5000/health > /dev/null 2>&1; then
         echo "[onstart] Server is healthy and ready!"
         exit 0
     fi
-    echo "[onstart] Waiting for server... ($i/30)"
+    echo "[onstart] Waiting for server... ($i/150)"
     sleep 2
 done
 
-echo "[onstart] ERROR: Server failed to start in 60 seconds"
+echo "[onstart] ERROR: Server failed to start in 300 seconds"
 cat /var/log/whisperx_server.log
 exit 1
