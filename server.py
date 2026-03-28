@@ -65,8 +65,9 @@ def load_models():
     if HF_TOKEN:
         log.info("Loading Pyannote diarization pipeline...")
         t0 = time.time()
-        diarize_pipeline = whisperx.DiarizationPipeline(
-            use_auth_token=HF_TOKEN,
+        from whisperx.diarize import DiarizationPipeline
+        diarize_pipeline = DiarizationPipeline(
+            token=HF_TOKEN,
             device=DEVICE
         )
         log.info(f"Pyannote pipeline loaded in {time.time() - t0:.1f}s")
@@ -159,8 +160,8 @@ async def transcribe(file: UploadFile = File(...)):
         if diarize_pipeline is not None:
             log.info(f"[{job_id}] Step 3/4: Diarizing...")
             t0 = time.time()
-            diarize_segments = diarize_pipeline(audio)
-            result = whisperx.assign_word_speakers(diarize_segments, result)
+            diarize_df = diarize_pipeline(audio)
+            result = whisperx.assign_word_speakers(diarize_df, result)
             t_diarize = time.time() - t0
             log.info(f"[{job_id}] Diarization done in {t_diarize:.1f}s")
         else:
