@@ -24,8 +24,13 @@ COPY server.py .
 COPY onstart.sh .
 RUN chmod +x onstart.sh
 
-# Pre-download Whisper model at build time (caches in image)
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')" || true
+# Pre-download the podlodka-turbo model at build time (caches in image)
+# This is the CTranslate2-converted version of bond005/whisper-podlodka-turbo
+# optimized for Russian ASR with lower WER and built-in punctuation
+RUN python -c "\
+from faster_whisper import WhisperModel; \
+print('Downloading bzikst/faster-whisper-podlodka-turbo...'); \
+WhisperModel('bzikst/faster-whisper-podlodka-turbo', device='cpu', compute_type='int8')" || true
 
 EXPOSE 5000
 
