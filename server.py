@@ -100,7 +100,7 @@ def load_models():
     }
 
     vad_options = {
-        "vad_onset": 0.500,
+        "vad_onset": 0.250,
         "vad_offset": 0.363,
     }
 
