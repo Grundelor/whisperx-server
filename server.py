@@ -26,6 +26,7 @@ import time
 import uuid
 import logging
 import tempfile
+import subprocess
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -65,14 +66,12 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 PORT = int(os.getenv("PORT", "5000"))
 
 # Transcription quality parameters
-BEAM_SIZE = int(os.getenv("BEAM_SIZE", "10"))  # Higher = more accurate, slower
+BEAM_SIZE = int(os.getenv("BEAM_SIZE", "5"))  # 5 = default, stable on noisy audio
 
-# Default prompt for Russian legal/courtroom context.
-# Overridden by per-request 'prompt' field if provided.
-DEFAULT_PROMPT = os.getenv(
-    "DEFAULT_PROMPT",
-    "Судебное заседание. Арбитражный суд. Протокол."
-)
+# Default prompt — empty by default.
+# Per-request 'prompt' field overrides this (user context descriptions).
+# Previously was "Судебное заседание..." which biased non-legal audio to silence.
+DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "")
 
 # ── Global model references ──────────────────────────────────────────
 
@@ -95,19 +94,22 @@ def load_models():
     asr_options = {
         "beam_size": BEAM_SIZE,
         "word_timestamps": True,
-        "condition_on_previous_text": True,
-        "initial_prompt": DEFAULT_PROMPT,
+        "condition_on_previous_text": False,  # Prevent empty-segment cascading
     }
+    # Only set initial_prompt if configured (empty = let model decide freely)
+    if DEFAULT_PROMPT:
+        asr_options["initial_prompt"] = DEFAULT_PROMPT
 
     vad_options = {
-        "vad_onset": 0.250,
+        "vad_onset": 0.250,   # Preprocessing handles noise, keep default to not miss quiet speech
         "vad_offset": 0.363,
     }
 
     log.info(f"Loading WhisperX model '{WHISPER_MODEL}' on {DEVICE} ({COMPUTE_TYPE})...")
     log.info(f"ASR options: beam_size={BEAM_SIZE}, "
-             f"condition_on_previous_text=True, "
-             f"initial_prompt='{DEFAULT_PROMPT[:50]}...'")
+             f"condition_on_previous_text=False, "
+             f"initial_prompt='{DEFAULT_PROMPT[:50] if DEFAULT_PROMPT else '(none)'}'"
+             f", vad_onset={vad_options['vad_onset']}")
     t0 = time.time()
     whisper_model = whisperx.load_model(
         WHISPER_MODEL,
@@ -186,6 +188,59 @@ async def health():
     }
 
 
+# ── Audio Preprocessing ──────────────────────────────────────────────
+
+def _preprocess_audio(input_path: str, output_path: str, job_id: str) -> str | None:
+    """Preprocess audio with ffmpeg for better recognition on noisy/quiet recordings.
+
+    Pipeline:
+        1. highpass=200       — remove low-frequency rumble (traffic, AC, vibrations)
+        2. afftdn=nf=-20      — FFT-based noise reduction (removes background hiss)
+        3. compand            — dynamic range compression (boosts quiet speech)
+        4. loudnorm           — EBU R128 loudness normalization (consistent volume)
+        5. aresample=16000    — resample to 16kHz (WhisperX native rate)
+
+    Returns output_path on success, None on failure (caller falls back to original).
+    """
+    filter_chain = (
+        "highpass=f=200,"
+        "afftdn=nf=-20,"
+        "compand=attacks=0.3:decays=0.8:points=-80/-80|-45/-25|-27/-15|0/-7|20/-7:gain=5,"
+        "loudnorm=I=-16:LRA=11:TP=-1.5,"
+        "aresample=16000"
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-af", filter_chain,
+        "-ac", "1",          # mono (better for speech)
+        "-ar", "16000",      # 16kHz
+        "-c:a", "pcm_s16le", # WAV 16-bit
+        output_path
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120
+        )
+        if proc.returncode != 0:
+            log.warning(f"[{job_id}] Audio preprocessing failed: {proc.stderr[:200]}")
+            return None
+
+        output_size = os.path.getsize(output_path) / (1024 * 1024)
+        log.info(f"[{job_id}] Preprocessed audio: {output_size:.1f} MB (16kHz mono WAV)")
+        return output_path
+
+    except subprocess.TimeoutExpired:
+        log.warning(f"[{job_id}] Audio preprocessing timed out (120s)")
+        return None
+    except Exception as e:
+        log.warning(f"[{job_id}] Audio preprocessing error: {e}")
+        return None
+
+
+# ── FastAPI Endpoints ─────────────────────────────────────────────────
+
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
@@ -194,6 +249,7 @@ async def transcribe(
     """Transcribe an audio file with speaker diarization.
 
     Accepts any audio format supported by ffmpeg.
+    Automatically preprocesses audio (noise reduction, loudness normalization).
 
     Args:
         file: Audio file upload.
@@ -209,12 +265,14 @@ async def transcribe(
 
     # Apply per-request prompt if provided, otherwise use default
     active_prompt = prompt.strip() if prompt else DEFAULT_PROMPT
-    _update_model_prompt(active_prompt)
+    if active_prompt:
+        _update_model_prompt(active_prompt)
 
     # Save uploaded file to temp
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
     job_id = uuid.uuid4().hex[:8]
     tmp_path = os.path.join(tempfile.gettempdir(), f"whisperx_{job_id}{suffix}")
+    clean_path = os.path.join(tempfile.gettempdir(), f"whisperx_{job_id}_clean.wav")
 
     try:
         log.info(f"[{job_id}] Received file: {file.filename} ({file.content_type})")
@@ -226,11 +284,19 @@ async def transcribe(
         file_size_mb = len(content) / (1024 * 1024)
         log.info(f"[{job_id}] Saved {file_size_mb:.1f} MB to {tmp_path}")
 
+        # ── Step 0: Audio preprocessing (noise reduction + normalization) ──
+        log.info(f"[{job_id}] Step 0: Preprocessing audio...")
+        t0 = time.time()
+        preprocessed = _preprocess_audio(tmp_path, clean_path, job_id)
+        audio_path = preprocessed if preprocessed else tmp_path
+        t_preprocess = time.time() - t0
+        log.info(f"[{job_id}] Preprocessing done in {t_preprocess:.1f}s")
+
         # ── Step 1: Transcribe ────────────────────────────────────
         log.info(f"[{job_id}] Step 1/4: Transcribing "
                  f"(beam={BEAM_SIZE}, model={WHISPER_MODEL})...")
         t0 = time.time()
-        audio = whisperx.load_audio(tmp_path)
+        audio = whisperx.load_audio(audio_path)
         result = whisper_model.transcribe(audio, batch_size=BATCH_SIZE, language=LANGUAGE)
         t_transcribe = time.time() - t0
         log.info(f"[{job_id}] Transcription done in {t_transcribe:.1f}s "
@@ -308,12 +374,13 @@ async def transcribe(
         log.error(f"[{job_id}] Error: {e}", exc_info=True)
         raise HTTPException(500, detail=str(e))
     finally:
-        # Cleanup temp file
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # Cleanup temp files
+        for p in (tmp_path, clean_path):
+            if os.path.exists(p):
+                os.remove(p)
 
         # Restore default prompt after per-request override
-        if prompt:
+        if active_prompt and active_prompt != DEFAULT_PROMPT:
             _update_model_prompt(DEFAULT_PROMPT)
 
 
